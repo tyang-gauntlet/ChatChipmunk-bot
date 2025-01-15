@@ -56,3 +56,6 @@ docker-compose.override.yml
 # Windows
 Thumbs.db
 
+task-definition.json
+task-definition-with-env.json
+*.pem

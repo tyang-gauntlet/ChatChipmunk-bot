@@ -1,3 +1,5 @@
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, UUID4
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain.prompts.prompt import PromptTemplate
 from langchain_pinecone import PineconeVectorStore
@@ -5,8 +7,43 @@ from langchain.schema import Document
 from dotenv import load_dotenv
 from supabase.client import create_client, Client
 import os
+from typing import Optional
+import logging
+import uuid
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI()
+
+# Pydantic models for request/response
+class Message(BaseModel):
+    content: str
+    channel_id: UUID4
+    user_id: Optional[str] = None
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "content": "What are the recent messages?",
+                "channel_id": "123e4567-e89b-12d3-a456-426614174000",  # Example UUID
+                "user_id": None
+            }
+        }
+
+class ChatResponse(BaseModel):
+    response: str
+    channel_id: UUID4
+
+# Global variables for initialized services
+vectorstore = None
+embeddings = None
+supabase = None
+PINECONE_INDEX = None
 
 def load_environment():
+    logger.info("Loading environment variables...")
     load_dotenv()
     required_vars = [
         "PINECONE_API_KEY",
@@ -19,16 +56,57 @@ def load_environment():
     for var in required_vars:
         val = os.getenv(var)
         if val is None:
-            raise ValueError(f"Please set the environment variable {var} in your .env file.")
+            logger.error(f"Missing environment variable: {var}")
+            raise ValueError(f"Missing environment variable: {var}")
         os.environ[var] = val
+    logger.info("Environment variables loaded successfully")
     return os.getenv("PINECONE_INDEX")
 
-def fetch_messages_from_db():
+def initialize_supabase():
+    logger.info("Initializing Supabase client...")
     supabase_url = os.getenv("NEXT_PUBLIC_SUPABASE_URL") or os.getenv("SUPABASE_URL")
     supabase_key = os.getenv("NEXT_PUBLIC_SUPABASE_ANON_KEY") or os.getenv("SUPABASE_KEY")
-    supabase: Client = create_client(supabase_url, supabase_key)
+    if not supabase_url or not supabase_key:
+        logger.error("Missing Supabase credentials")
+        raise ValueError("Missing Supabase credentials")
+    return create_client(supabase_url, supabase_key)
 
-    # Single query to get messages with usernames
+async def initialize_services():
+    global vectorstore, embeddings, supabase, PINECONE_INDEX
+    try:
+        logger.info("Starting service initialization...")
+        
+        # Load environment variables
+        PINECONE_INDEX = load_environment()
+        
+        # Initialize Supabase
+        supabase = initialize_supabase()
+        
+        # Initialize embeddings
+        logger.info("Initializing OpenAI embeddings...")
+        embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
+        
+        # Fetch messages and initialize vectorstore
+        logger.info("Fetching messages from database...")
+        documents = fetch_messages_from_db()
+        logger.info(f"Found {len(documents)} messages")
+        
+        logger.info("Initializing Pinecone vectorstore...")
+        vectorstore = PineconeVectorStore.from_documents(
+            documents=documents,
+            embedding=embeddings,
+            index_name=PINECONE_INDEX
+        )
+        logger.info("Service initialization completed successfully")
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize services: {str(e)}")
+        raise
+
+def fetch_messages_from_db():
+    if not supabase:
+        raise ValueError("Supabase client not initialized")
+        
     response = supabase.from_("messages").select(
         "content, created_at, channel_id, users(username)"
     ).neq("content", None).order("created_at", desc=True).execute()
@@ -62,24 +140,48 @@ def fetch_messages_from_db():
     
     return documents
 
-def initialize_vectorstore(documents):
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
-    vectorstore = PineconeVectorStore.from_documents(
-        documents=documents,
-        embedding=embeddings,
-        index_name=PINECONE_INDEX
-    )
-    return vectorstore, embeddings
+async def store_bot_response(content: str, channel_id: UUID4):
+    if not supabase:
+        raise ValueError("Supabase client not initialized")
+        
+    try:
+        # First verify the channel exists
+        channel_check = supabase.from_("channels").select("id").eq("id", str(channel_id)).execute()
+        if not channel_check.data:
+            raise HTTPException(status_code=404, detail=f"Channel {channel_id} not found")
 
-def query_vectorstore(query, vectorstore, embeddings):
+        # Get bot user
+        bot_user = supabase.from_("users").select("id").eq("username", "bot").execute()
+        
+        logger.info(f"bot_user: {bot_user.data}")
+
+        # Insert the message
+        response = supabase.from_("messages").insert({
+            "content": content,
+            "channel_id": str(channel_id),
+            "user_id": bot_user.data[0]["id"]
+        }).execute()
+        
+        logger.info(f"Successfully stored bot response in channel {channel_id}")
+        return response
+        
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(f"Failed to store bot response: {str(e)}")
+        # Log the full error details for debugging
+        logger.error(f"Full error details: {repr(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Database error: {str(e)}"
+        )
+
+def query_vectorstore(query: str, channel_id: UUID4):
+    if not vectorstore:
+        raise ValueError("Vectorstore not initialized")
+        
     retriever = vectorstore.as_retriever()
     context = retriever.invoke(query)
-    
-    print("\nRelevant messages found:")
-    print("------------------------")
-    for doc in context:
-        print(f"{doc.page_content}\n")
-    print("------------------------")
     
     template = PromptTemplate(
         template="Based on the chat history provided, please answer the following question: {query}\n\nRelevant chat context: {context}",
@@ -92,35 +194,54 @@ def query_vectorstore(query, vectorstore, embeddings):
     
     return results.content
 
-def main():
-    global PINECONE_INDEX
-    PINECONE_INDEX = load_environment()
-    
-    print("Fetching messages from database...")
-    documents = fetch_messages_from_db()
-    print(f"Found {len(documents)} messages")
-    
-    print("Initializing vector store...")
-    vectorstore, embeddings = initialize_vectorstore(documents)
-    print("Vector store initialized")
-    
-    print("\nChat History Query System")
-    print("Enter your questions (or 'quit' to exit)")
-    
-    while True:
-        query = input("\nYour question: ").strip()
-        if query.lower() in ['quit', 'exit', 'q']:
-            break
-            
-        if not query:
-            continue
-            
-        try:
-            response = query_vectorstore(query, vectorstore, embeddings)
-            print("\nResponse:", response)
-        except Exception as e:
-            print(f"Error processing query: {e}")
+@app.on_event("startup")
+async def startup_event():
+    await initialize_services()
 
-if __name__ == "__main__":
-    load_dotenv()
-    main() 
+@app.post("/chat", response_model=ChatResponse)
+async def chat_endpoint(message: Message):
+    if not vectorstore:
+        raise HTTPException(status_code=503, detail="Service not fully initialized")
+        
+    try:
+        # Get bot's response
+        response = query_vectorstore(message.content, message.channel_id)
+        
+        # Store the bot's response in the database
+        await store_bot_response(response, message.channel_id)
+        
+        return ChatResponse(response=response, channel_id=message.channel_id)
+    except ValueError as e:
+        logger.error(f"Validation error: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error in chat endpoint: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/health")
+async def health_check():
+    if not vectorstore:
+        return {"status": "initializing"}
+    return {"status": "healthy"}
+
+@app.get("/debug/channel/{channel_id}")
+async def debug_channel(channel_id: UUID4):
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Supabase not initialized")
+    
+    try:
+        # Check channel
+        channel = supabase.from_("channels").select("*").eq("id", str(channel_id)).execute()
+        
+        # Check if bot user exists
+        bot_user = supabase.from_("users").select("*").eq("id", "bot").execute()
+        
+        return {
+            "channel_exists": len(channel.data) > 0,
+            "channel_data": channel.data,
+            "bot_user_exists": len(bot_user.data) > 0,
+            "bot_user_data": bot_user.data
+        }
+    except Exception as e:
+        logger.error(f"Debug endpoint error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e)) 

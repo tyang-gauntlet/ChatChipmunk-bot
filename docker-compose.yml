@@ -1,6 +1,11 @@
 services:
   chatbot:
-    build: .
+    image: chatchipmunk-api:latest
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    env_file:
+      - .env
     environment:
       - PINECONE_API_KEY=${PINECONE_API_KEY}
       - LANGCHAIN_API_KEY=${LANGCHAIN_API_KEY}
@@ -9,5 +14,4 @@ services:
       - PINECONE_INDEX=${PINECONE_INDEX}
       - NEXT_PUBLIC_SUPABASE_URL=${NEXT_PUBLIC_SUPABASE_URL}
       - NEXT_PUBLIC_SUPABASE_ANON_KEY=${NEXT_PUBLIC_SUPABASE_ANON_KEY}
-    volumes:
-      - .:/app
+      - PYTHONUNBUFFERED=1
