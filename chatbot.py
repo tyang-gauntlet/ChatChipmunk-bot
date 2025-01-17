@@ -1,15 +1,14 @@
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, UUID4
+from pydantic import BaseModel
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain.prompts.prompt import PromptTemplate
 from langchain_pinecone import PineconeVectorStore
 from langchain.schema import Document
 from dotenv import load_dotenv
-from supabase.client import create_client, Client
+from supabase.client import create_client
 import os
 from typing import Optional
 import logging
-import uuid
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -20,21 +19,9 @@ app = FastAPI()
 # Pydantic models for request/response
 class Message(BaseModel):
     content: str
-    channel_id: UUID4
-    user_id: Optional[str] = None
-
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "content": "What are the recent messages?",
-                "channel_id": "123e4567-e89b-12d3-a456-426614174000",  # Example UUID
-                "user_id": None
-            }
-        }
 
 class ChatResponse(BaseModel):
-    response: str
-    channel_id: UUID4
+    content: str
 
 # Global variables for initialized services
 vectorstore = None
@@ -99,20 +86,31 @@ async def initialize_services():
         )
         logger.info("Service initialization completed successfully")
         
+        # Update all messages to be vectorized
+        logger.info("Updating all messages to be vectorized...")
+        update_messages_to_vectorized()
+        
     except Exception as e:
         logger.error(f"Failed to initialize services: {str(e)}")
         raise
+
+def update_messages_to_vectorized():
+    if not supabase:
+        raise ValueError("Supabase client not initialized")
+        
+    supabase.from_("messages").update({"vectorized": True}).neq("content", None).execute()
 
 def fetch_messages_from_db():
     if not supabase:
         raise ValueError("Supabase client not initialized")
         
     response = supabase.from_("messages").select(
-        "content, created_at, channel_id, users(username)"
-    ).neq("content", None).order("created_at", desc=True).execute()
+        "content, created_at, channel_id, vectorized, users(username)"
+    ).neq("content", None).eq("vectorized", False).order("created_at", desc=True).execute()
     
     documents = []
     for msg in response.data:
+
         content = msg.get("content")
         created_at = msg.get("created_at")
         channel_id = msg.get("channel_id")
@@ -140,43 +138,59 @@ def fetch_messages_from_db():
     
     return documents
 
-async def store_bot_response(content: str, channel_id: UUID4):
+def handle_fake_response(query: str) -> str:
+    """Handle queries starting with /fake"""
+    # Extract username and query from /fake command
+    actual_query = query.removeprefix("/fake").strip()
+    username = actual_query.split()[0]
+    actual_query = actual_query[len(username):].strip()
+
+    # Get relevant context from vectorstore
+    if not vectorstore:
+        raise ValueError("Vectorstore not initialized")
+    
+    retriever = vectorstore.as_retriever()
+    context = retriever.invoke(actual_query)
+
+    template = PromptTemplate(
+        template="""Based on the following chat history, generate a response as if you are {username} continuing the conversation.
+        Format your response as '{username}: [response]'
+        
+        Chat history context:
+        {context}
+        
+        Query to respond to: {query}
+        
+        Remember to stay in character as {username} and reference relevant details from the chat history.
+        """,
+        input_variables=["query", "username", "context"]
+    )
+    
+    llm = ChatOpenAI(temperature=0.7, model_name="gpt-4")
+    prompt = template.invoke({
+        "query": actual_query,
+        "username": username,
+        "context": context
+    })
+    results = llm.invoke(prompt)
+    
+    return results.content
+
+def handle_file_query(query: str) -> str:
+    """Handle queries about files in Supabase storage"""
     if not supabase:
         raise ValueError("Supabase client not initialized")
-        
-    try:
-        # First verify the channel exists
-        channel_check = supabase.from_("channels").select("id").eq("id", str(channel_id)).execute()
-        if not channel_check.data:
-            raise HTTPException(status_code=404, detail=f"Channel {channel_id} not found")
+    
+    # TODO: Implement file vectorization and querying from Supabase storage
+    # This would involve:
+    # 1. Fetching files from Supabase storage 'uploads' folder
+    # 2. Processing/vectorizing their content
+    # 3. Querying against those vectors
+    
+    return "File querying functionality is not implemented yet"
 
-        # Get bot user
-        bot_user = supabase.from_("users").select("id").eq("username", "bot").execute()
-        
-        logger.info(f"bot_user: {bot_user.data}")
-
-        # Insert the message
-        response = supabase.from_("messages").insert({
-            "content": content,
-            "channel_id": str(channel_id),
-            "user_id": bot_user.data[0]["id"]
-        }).execute()
-        
-        logger.info(f"Successfully stored bot response in channel {channel_id}")
-        return response
-        
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        logger.error(f"Failed to store bot response: {str(e)}")
-        # Log the full error details for debugging
-        logger.error(f"Full error details: {repr(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Database error: {str(e)}"
-        )
-
-def query_vectorstore(query: str, channel_id: UUID4):
+def handle_normal_query(query: str) -> str:
+    """Handle regular queries using existing vectorstore"""
     if not vectorstore:
         raise ValueError("Vectorstore not initialized")
         
@@ -194,6 +208,36 @@ def query_vectorstore(query: str, channel_id: UUID4):
     
     return results.content
 
+async def update_vectorstore():
+    """Update vectorstore with any new messages before processing query"""
+    try:
+        logger.info("Fetching new messages for vectorstore update...")
+        documents = fetch_messages_from_db()
+        if documents:
+            logger.info(f"Found {len(documents)} new messages to vectorize")
+            # Add new documents to existing vectorstore
+            await vectorstore.aadd_documents(documents)
+            # Mark messages as vectorized
+            update_messages_to_vectorized()
+            logger.info("Vectorstore update completed")
+    except Exception as e:
+        logger.error(f"Error updating vectorstore: {str(e)}")
+        raise
+
+async def process_query(query: str) -> str:
+    """Process the query based on its prefix"""
+    # Update vectorstore before processing query
+    await update_vectorstore()
+    
+    query = query.strip()
+    
+    if query.startswith("/fake"):
+        return handle_fake_response(query)
+    elif query.lower().startswith("/file"):
+        return handle_file_query(query)
+    else:
+        return handle_normal_query(query)
+
 @app.on_event("startup")
 async def startup_event():
     await initialize_services()
@@ -204,13 +248,9 @@ async def chat_endpoint(message: Message):
         raise HTTPException(status_code=503, detail="Service not fully initialized")
         
     try:
-        # Get bot's response
-        response = query_vectorstore(message.content, message.channel_id)
+        response = await process_query(message.content)
         
-        # Store the bot's response in the database
-        await store_bot_response(response, message.channel_id)
-        
-        return ChatResponse(response=response, channel_id=message.channel_id)
+        return ChatResponse(content=response)
     except ValueError as e:
         logger.error(f"Validation error: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
@@ -223,25 +263,3 @@ async def health_check():
     if not vectorstore:
         return {"status": "initializing"}
     return {"status": "healthy"}
-
-@app.get("/debug/channel/{channel_id}")
-async def debug_channel(channel_id: UUID4):
-    if not supabase:
-        raise HTTPException(status_code=503, detail="Supabase not initialized")
-    
-    try:
-        # Check channel
-        channel = supabase.from_("channels").select("*").eq("id", str(channel_id)).execute()
-        
-        # Check if bot user exists
-        bot_user = supabase.from_("users").select("*").eq("id", "bot").execute()
-        
-        return {
-            "channel_exists": len(channel.data) > 0,
-            "channel_data": channel.data,
-            "bot_user_exists": len(bot_user.data) > 0,
-            "bot_user_data": bot_user.data
-        }
-    except Exception as e:
-        logger.error(f"Debug endpoint error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e)) 
